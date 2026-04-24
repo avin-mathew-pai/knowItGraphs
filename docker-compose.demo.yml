@@ -1,0 +1,211 @@
+# Demo overlay — brings up a real Airflow + Spark + MinIO stack that exercises
+# the user-provided JAR (sds-ei-analytics_2.13-1.0.1.jar) against the Scala
+# unit-test's CSVs and JSON config. A deliberately-corrupted CSV partition
+# makes the Spark job fail; the DAG's on_failure_callback posts the incident
+# to KnowIT's /api/incidents/ingest, which autocreates a session with the
+# grounded diagnosis.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+#   open http://localhost:8080    # KnowIT UI
+#   open http://localhost:8088    # Airflow UI (admin / admin)
+#   open http://localhost:9001    # MinIO console (minio / minio12345)
+
+services:
+  # ---------- MinIO object store ----------
+  minio:
+    image: minio/minio:latest
+    container_name: knowit-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: knowit-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set local http://minio:9000 minio minio12345 &&
+        mc mb --ignore-existing local/demo-kg &&
+        mc anonymous set public local/demo-kg &&
+        echo "✔ bucket demo-kg ready"
+    restart: "no"
+
+  # ---------- Airflow metadata DB ----------
+  postgres:
+    image: postgres:15
+    container_name: knowit-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- One-shot volume permission fix ----------
+  # Docker named volumes default to root:root 0755 which blocks the Airflow
+  # user (uid 50000) from creating subdirs. Runs once per `compose up` as
+  # root and makes demo_workdir world-writable so airflow-scheduler, the
+  # spark containers, and the seed/prep tasks can all read+write it.
+  volume-init:
+    image: busybox:latest
+    container_name: knowit-volume-init
+    volumes:
+      - demo_workdir:/mnt/demo/workdir
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mkdir -p /mnt/demo/workdir &&
+        chmod -R 777 /mnt/demo/workdir &&
+        echo "✔ demo_workdir permissions set (777)"
+    restart: "no"
+
+  # ---------- Spark cluster (4.0.1 / Scala 2.13 / Iceberg 1.10 baked in) ----------
+  spark-master:
+    build:
+      context: ./demo/spark
+      dockerfile: Dockerfile
+    image: knowit-spark:4.0.1
+    container_name: knowit-spark-master
+    command: ["master"]
+    ports:
+      - "7077:7077"
+      - "8090:8080"   # Spark master UI (host 8090 to avoid KnowIT app on 8080)
+    environment:
+      SPARK_MASTER_HOST: spark-master
+    volumes:
+      - ./demo/jars:/mnt/demo/jars:ro
+      - demo_workdir:/mnt/demo/workdir
+      - ./demo/seed:/mnt/demo/seed:ro
+      - ./demo/spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ${SDS_EI_REPO:-../../sds-solution-ei}/analytics/src/test/resources:/mnt/test-resources:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      volume-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  spark-worker:
+    image: knowit-spark:4.0.1
+    container_name: knowit-spark-worker
+    command: ["worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "3G"
+    volumes:
+      - ./demo/jars:/mnt/demo/jars:ro
+      - demo_workdir:/mnt/demo/workdir
+      - ./demo/seed:/mnt/demo/seed:ro
+      - ./demo/spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ${SDS_EI_REPO:-../../sds-solution-ei}/analytics/src/test/resources:/mnt/test-resources:ro
+    depends_on:
+      - spark-master
+    restart: unless-stopped
+
+  # ---------- Airflow (has Spark 4.0.1 client baked in for spark-submit) ----------
+  airflow-init:
+    build:
+      context: ./demo/airflow
+      dockerfile: Dockerfile
+    image: knowit-airflow:2.10.3
+    container_name: knowit-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      KNOWIT_URL: http://app:8080
+      SPARK_MASTER_URL: spark://spark-master:7077
+      AIRFLOW_UID: "50000"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname A --lastname D --role Admin --email admin@local || true
+    restart: "no"
+
+  airflow-webserver:
+    image: knowit-airflow:2.10.3
+    container_name: knowit-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8088:8080"
+    environment: *airflow-env
+    # Clear any stale webserver PID file before gunicorn starts. Without
+    # this, a hard-restarted container boot-loops with
+    # "Already running on PID N (or pid file is stale)".
+    command:
+      - bash
+      - -c
+      - "rm -f /opt/airflow/airflow-webserver.pid && exec airflow webserver"
+    volumes:
+      - ./demo/dags:/opt/airflow/dags:ro
+      - airflow_logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: knowit-airflow:2.10.3
+    container_name: knowit-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      volume-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    command: scheduler
+    volumes:
+      - ./demo/dags:/opt/airflow/dags:ro
+      - ./demo/jars:/mnt/demo/jars:ro
+      - demo_workdir:/mnt/demo/workdir
+      - ./demo/seed:/mnt/demo/seed:ro
+      - airflow_logs:/opt/airflow/logs
+      - ${SDS_EI_REPO:-../../sds-solution-ei}/analytics/src/test/resources:/mnt/test-resources:ro
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+  postgres_data:
+  airflow_logs:
+  # Managed volume for prep_inputs output + spark-submit inputs.
+  # Using a named volume (not a bind mount to ./demo/workdir) avoids the
+  # Windows/WSL2 permission error where the airflow user (uid 50000) can't
+  # write into a host-Windows-owned directory.
+  demo_workdir:

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "knowit-graphs": {
+      "url": "http://localhost:8765/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_AGENT_API_TOKEN"
+      }
+    }
+  }
+}

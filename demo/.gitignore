@@ -1,0 +1,3 @@
+workdir/*
+!workdir/.gitkeep
+jars/*.jar

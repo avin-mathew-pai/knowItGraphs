@@ -1,0 +1,5 @@
+# Extra Python packages for the Airflow image.
+# `requests` is already bundled with apache/airflow:2.10.3 so we don't pin it here
+# (pinning a different version triggers Airflow's constraint resolver and fails
+# the build). Add new pins below ONLY if you also supply the matching
+# Airflow constraint file via --constraint "URL".
