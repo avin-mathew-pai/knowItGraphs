@@ -128,6 +128,18 @@ docker exec knowit-minio mc rm --recursive --force local/demo-kg/iceberg/
 
 ---
 
+## Diagrams
+
+### System architecture
+![Architecture](docs/architecture.png)
+
+### Incident diagnosis flow (Airflow → KnowIT → UI)
+![Incident flow](docs/incident_flow.png)
+
+> Source Mermaid files: `docs/architecture.mmd` · `docs/incident_flow.mmd`
+
+---
+
 ## Architecture — how the pieces connect
 
 ```
